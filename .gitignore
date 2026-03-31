@@ -1,0 +1,19 @@
+# .NET build output
+bin/
+obj/
+
+# 测试数据文件（不提交到仓库）
+*.map
+*.scen
+*.csv
+paths.txt
+
+# IDE
+.idea/
+*.user
+*.suo
+.vs/
+
+# 发布输出
+csharp_bin/
+publish/
