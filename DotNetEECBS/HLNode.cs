@@ -52,6 +52,9 @@ public abstract class HLNode
     /// <summary>是否已完全展开</summary>
     public bool FullyExpanded;
 
+    /// <summary>该节点从哪个列表被选出（"cleanup"/"open"/"focal"），用于统计和 EES 逻辑</summary>
+    public string ChosenFrom = "none";
+
     public HLNode? Parent;
     public List<HLNode> Children = new();
 

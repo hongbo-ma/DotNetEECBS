@@ -160,14 +160,218 @@ public class CBSHeuristic
     }
 
     // -------------------------------------------------------------------------
-    // 在线启发式误差更新（用于非容许启发式，暂时空实现）
+    // 非容许启发式类型 + 在线学习误差统计
     // -------------------------------------------------------------------------
 
-    public void UpdateOnlineHeuristicErrors(CBSNode curr) { }
-    public void UpdateOnlineHeuristicErrors(ECBSNode curr) { }
-    public void UpdateInadmissibleHeuristics(HLNode curr) { }
-    public double GetCostError(int i = 0) => 0;
-    public double GetDistanceError(int i = 0) => 0;
+    private HeuristicsType _inadmissibleHeuristic = HeuristicsType.Zero;
+    private List<double> _sumDistanceErrors = new() { 0 };
+    private List<double> _sumCostErrors     = new() { 0 };
+    private List<int>    _numOfErrors       = new() { 0 };
+
+    public void SetInadmissibleHeuristics(HeuristicsType h)
+    {
+        _inadmissibleHeuristic = h;
+        int count = h == HeuristicsType.Conflict ? 5 : 1; // TYPE_COUNT = 5
+        _sumDistanceErrors = new List<double>(new double[count]);
+        _sumCostErrors     = new List<double>(new double[count]);
+        _numOfErrors       = new List<int>(h == HeuristicsType.Conflict
+            ? Enumerable.Repeat(1, count).ToList()
+            : new List<int>(new int[count]));
+    }
+
+    public double GetCostError(int i = 0)     => _numOfErrors[i] == 0 ? 0 : _sumCostErrors[i]     / _numOfErrors[i];
+    public double GetDistanceError(int i = 0) => _numOfErrors[i] == 0 ? 0 : _sumDistanceErrors[i] / _numOfErrors[i];
+
+    // -------------------------------------------------------------------------
+    // 在线学习：更新 CBS 节点的启发式误差
+    // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// CBS 版本：当父节点的所有子节点都计算完 h 后，
+    /// 用最优子节点的实际代价更新误差统计。
+    /// </summary>
+    public void UpdateOnlineHeuristicErrors(CBSNode curr)
+    {
+        if (_inadmissibleHeuristic != HeuristicsType.Global &&
+            _inadmissibleHeuristic != HeuristicsType.Path   &&
+            _inadmissibleHeuristic != HeuristicsType.Local  &&
+            _inadmissibleHeuristic != HeuristicsType.Conflict) return;
+        if (curr.Parent == null) return;
+
+        curr.Parent.FullyExpanded = true;
+        HLNode best = curr;
+        foreach (var child in curr.Parent.Children)
+        {
+            if (!child.HComputed) { curr.Parent.FullyExpanded = false; break; }
+            if (best.FVal > child.FVal ||
+                (best.FVal == child.FVal && best.DistanceToGo > child.DistanceToGo))
+                best = child;
+        }
+
+        if (!curr.Parent.FullyExpanded) return;
+
+        curr.Parent.DistanceError = 1 + best.DistanceToGo - curr.Parent.DistanceToGo;
+        curr.Parent.CostError     = best.GVal + best.HVal - curr.Parent.GVal - curr.Parent.HVal;
+
+        switch (_inadmissibleHeuristic)
+        {
+            case HeuristicsType.Global:
+                _sumDistanceErrors[0] += curr.Parent.DistanceError;
+                _sumCostErrors[0]     += curr.Parent.CostError;
+                _numOfErrors[0]++;
+                break;
+            case HeuristicsType.Local:
+                _numOfErrors[0]++;
+                double lr = Math.Max(0.001, 1.0 / _numOfErrors[0]);
+                _sumDistanceErrors[0] = _sumDistanceErrors[0] * (1 - lr) + curr.Parent.DistanceError * lr;
+                _sumCostErrors[0]     = _sumCostErrors[0]     * (1 - lr) + curr.Parent.CostError     * lr;
+                break;
+            case HeuristicsType.Conflict:
+                if (curr.Parent.ChosenConflict != null)
+                {
+                    int id = curr.Parent.ChosenConflict.GetConflictId();
+                    if (id < _sumDistanceErrors.Count)
+                    {
+                        _sumDistanceErrors[id] += curr.Parent.DistanceError;
+                        _sumCostErrors[id]     += curr.Parent.CostError;
+                        _numOfErrors[id]++;
+                    }
+                }
+                break;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // 在线学习：更新 ECBS 节点的启发式误差
+    // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// ECBS 版本：每次展开后立即更新（不等所有子节点完成）。
+    /// 误差 = 最优子节点的 f_hat - 当前节点的 sum_of_costs。
+    /// </summary>
+    public void UpdateOnlineHeuristicErrors(ECBSNode parent)
+    {
+        if (_inadmissibleHeuristic == HeuristicsType.Zero) return;
+        if (parent.Children.Count == 0) return;
+
+        // 找最优子节点（f_hat 最小，tie-break 用 distance_to_go）
+        HLNode best = parent.Children[0];
+        if (parent.Children.Count == 2)
+        {
+            var other = parent.Children[1];
+            if (best.GetFHatVal() > other.GetFHatVal() ||
+                (best.GetFHatVal() == other.GetFHatVal() && best.DistanceToGo > other.DistanceToGo))
+                best = other;
+        }
+
+        parent.DistanceError = 1 + best.DistanceToGo - parent.DistanceToGo;
+        parent.CostError     = best.GetFHatVal() - best.CostToGo - (parent as ECBSNode)!.SumOfCosts;
+
+        switch (_inadmissibleHeuristic)
+        {
+            case HeuristicsType.Global:
+                _sumDistanceErrors[0] += parent.DistanceError;
+                _sumCostErrors[0]     += parent.CostError;
+                _numOfErrors[0]++;
+                break;
+            case HeuristicsType.Local:
+                _numOfErrors[0]++;
+                double lr = Math.Max(0.001, 1.0 / _numOfErrors[0]);
+                _sumDistanceErrors[0] = _sumDistanceErrors[0] * (1 - lr) + parent.DistanceError * lr;
+                _sumCostErrors[0]     = _sumCostErrors[0]     * (1 - lr) + parent.CostError     * lr;
+                break;
+            case HeuristicsType.Conflict:
+                if (parent.ChosenConflict != null)
+                {
+                    int id = parent.ChosenConflict.GetConflictId();
+                    if (id < _sumCostErrors.Count)
+                    {
+                        _sumCostErrors[id]     += parent.CostError;
+                        _sumDistanceErrors[id] += parent.DistanceError;
+                        _numOfErrors[id]++;
+                    }
+                }
+                break;
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // 非容许启发式：计算 cost_to_go（用于 EES 的 OPEN 列表排序）
+    // -------------------------------------------------------------------------
+
+    /// <summary>
+    /// 根据在线学习的误差统计，计算节点的非容许 cost_to_go。
+    /// cost_to_go 越大，f_hat = sum_of_costs + cost_to_go 越大，
+    /// 节点在 OPEN 列表中优先级越低。
+    /// </summary>
+    public void UpdateInadmissibleHeuristics(HLNode curr)
+    {
+        int h = curr.GetName() == "CBS Node" ? curr.HVal : 0;
+        double c;
+
+        switch (_inadmissibleHeuristic)
+        {
+            case HeuristicsType.Path:
+                // 沿路径累积误差
+                _numOfErrors[0] = 0; _sumDistanceErrors[0] = 0; _sumCostErrors[0] = 0;
+                for (var ptr = curr.Parent; ptr != null; ptr = ptr.Parent)
+                    if (ptr.FullyExpanded)
+                    {
+                        _numOfErrors[0]++;
+                        _sumDistanceErrors[0] += ptr.DistanceError;
+                        _sumCostErrors[0]     += ptr.CostError;
+                    }
+                goto case HeuristicsType.Global; // fall-through
+
+            case HeuristicsType.Global:
+                if (_numOfErrors[0] < 1)
+                {
+                    curr.CostToGo = Math.Max(0, curr.FVal - curr.GetFHatVal());
+                    return;
+                }
+                c = _numOfErrors[0] <= _sumDistanceErrors[0]
+                    ? _sumCostErrors[0] / _numOfErrors[0] * 10
+                    : _sumCostErrors[0] / (_numOfErrors[0] - _sumDistanceErrors[0]);
+                curr.CostToGo = h + (int)(curr.DistanceToGo * c);
+                break;
+
+            case HeuristicsType.Local:
+                if (Math.Abs(1 - _sumDistanceErrors[0]) < 0.001)
+                    curr.CostToGo = h + Math.Max(0, curr.DistanceToGo * 1000);
+                else
+                    curr.CostToGo = h + Math.Max(0,
+                        (int)(curr.DistanceToGo * _sumCostErrors[0] / (1 - _sumDistanceErrors[0])));
+                break;
+
+            case HeuristicsType.Conflict:
+                if (curr.Conflicts.Count == 0 && curr.UnknownConflicts.Count == 0) return;
+                double costErr = 0, distErr = 0;
+                foreach (var conflict in curr.Conflicts)
+                {
+                    int id = conflict.GetConflictId();
+                    costErr += GetCostError(id);
+                    distErr += GetDistanceError(id);
+                }
+                if (curr.Conflicts.Count > 0)
+                {
+                    costErr /= curr.Conflicts.Count;
+                    distErr /= curr.Conflicts.Count;
+                }
+                curr.CostToGo = distErr >= 1
+                    ? (int)(curr.DistanceToGo * costErr)
+                    : (int)(curr.DistanceToGo * costErr / (1 - distErr));
+                curr.CostToGo = Math.Max(0, Math.Min(Common.MaxCost, curr.CostToGo));
+                curr.CostToGo += h;
+                break;
+
+            default:
+                return;
+        }
+
+        // 保证 f <= f_hat
+        if (curr.FVal > curr.GetFHatVal())
+            curr.CostToGo += curr.FVal - curr.GetFHatVal();
+    }
 
     // -------------------------------------------------------------------------
     // 图构建：CG（基数冲突图）

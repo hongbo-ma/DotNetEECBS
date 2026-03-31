@@ -5,12 +5,14 @@ using Path = List<PathEntry>;
 /// <summary>
 /// ECBS（Enhanced CBS）：次优多智能体路径规划。
 /// 在 CBS 基础上引入次优界 w，低层搜索使用 FindSuboptimalPath，
-/// 高层使用 AStarEps（CLEANUP + FOCAL）策略。
+/// 高层使用 EES（Explicit Estimation Search）三列表策略：
+/// CLEANUP（按 f 保证最优性下界）+ OPEN（按 f_hat 引导搜索）+ FOCAL（按 d 选冲突最少节点）。
 /// </summary>
 public class ECBS : CBS
 {
     private List<int> _minFVals = new();
 
+    // EES 三列表
     private readonly UpdatablePriorityQueue<ECBSNode> _ecbsCleanup
         = new(new ECBSNode.CompareByF());
     private readonly UpdatablePriorityQueue<ECBSNode> _ecbsOpen
@@ -25,7 +27,7 @@ public class ECBS : CBS
         : base(instance, sipp: false, screen)
     {
         _w = suboptimality;
-        SolverType = HighLevelSolverType.AStarEps;
+        SolverType = HighLevelSolverType.EES;
     }
 
     // -------------------------------------------------------------------------
@@ -46,29 +48,99 @@ public class ECBS : CBS
             var curr = EcbsSelectNode();
             if (EcbsTerminate(curr)) return SolutionFound;
 
+            // 仅从 CLEANUP 取出的节点（或根节点）才计算 WDG 启发式
+            if ((curr == DummyStart || curr.ChosenFrom == "cleanup") && !curr.HComputed)
+            {
+                Runtime = _sw.Elapsed.TotalSeconds;
+                bool succ = _cbsHeuristic.ComputeInformedHeuristics(curr, _minFVals, _timeLimit - Runtime);
+                Runtime = _sw.Elapsed.TotalSeconds;
+                if (!succ) { curr.Clear(); continue; }
+                if (EcbsReinsertNode(curr)) continue;
+            }
+
             ClassifyEcbsConflicts(curr);
 
             NumHLExpanded++;
             curr.TimeExpanded = NumHLExpanded;
 
-            var child0 = new ECBSNode();
-            var child1 = new ECBSNode();
-
-            curr.ChosenConflict = ChooseEcbsConflict(curr);
-            AddEcbsConstraints(curr, child0, child1);
-
-            bool[] solved    = { false, false };
-            var    pathsCopy = new List<Path?>(_paths);
-            var    fminCopy  = new List<int>(_minFVals);
-
-            for (int i = 0; i < 2; i++)
+            // ---- Bypass ----
+            if (Bypass && curr.ChosenFrom != "cleanup")
             {
-                if (i > 0) { _paths = pathsCopy; _minFVals = fminCopy; }
-                var child = i == 0 ? child0 : child1;
-                solved[i] = EcbsGenerateChild(child, curr);
-                if (!solved[i]) continue;
-                EcbsPushNode(child);
-                curr.Children.Add(child);
+                bool foundBypass = true;
+                while (foundBypass)
+                {
+                    if (EcbsTerminate(curr)) return SolutionFound;
+                    foundBypass = false;
+
+                    curr.ChosenConflict = ChooseEcbsConflict(curr);
+                    var bp0 = new ECBSNode();
+                    var bp1 = new ECBSNode();
+                    AddEcbsConstraints(curr, bp0, bp1);
+
+                    bool[] bpSolved = { false, false };
+                    var pathsCopyBp = new List<Path?>(_paths);
+                    var fminCopyBp  = new List<int>(_minFVals);
+
+                    for (int i = 0; i < 2; i++)
+                    {
+                        if (i > 0) { _paths = pathsCopyBp; _minFVals = fminCopyBp; }
+                        var bpChild = i == 0 ? bp0 : bp1;
+                        bpSolved[i] = EcbsGenerateChild(bpChild, curr);
+                        if (!bpSolved[i]) continue;
+                        if (i == 1 && !bpSolved[0]) continue;
+
+                        // Bypass 条件：sum_of_costs 在次优界内 且 冲突数减少 且 新路径不超过 w*min_f
+                        if (bpChild.SumOfCosts <= _w * _costLowerBound &&
+                            bpChild.DistanceToGo < curr.DistanceToGo)
+                        {
+                            bool pathOk = true;
+                            foreach (var (agId, path, minF) in bpChild.Paths)
+                                if ((double)(path.Count - 1) > _w * fminCopyBp[agId])
+                                { pathOk = false; break; }
+
+                            if (pathOk)
+                            {
+                                foundBypass = true;
+                                EcbsAdoptBypass(curr, bpChild, fminCopyBp);
+                                NumAdoptBypass++;
+                                break;
+                            }
+                        }
+                    }
+
+                    if (foundBypass)
+                        ClassifyEcbsConflicts(curr);
+                    else
+                    {
+                        for (int i = 0; i < 2; i++)
+                        {
+                            var bpChild = i == 0 ? bp0 : bp1;
+                            if (bpSolved[i]) { EcbsPushNode(bpChild); curr.Children.Add(bpChild); }
+                        }
+                    }
+                }
+            }
+            else
+            {
+                // 无 Bypass：直接展开
+                var child0 = new ECBSNode();
+                var child1 = new ECBSNode();
+                curr.ChosenConflict = ChooseEcbsConflict(curr);
+                AddEcbsConstraints(curr, child0, child1);
+
+                bool[] solved    = { false, false };
+                var    pathsCopy = new List<Path?>(_paths);
+                var    fminCopy  = new List<int>(_minFVals);
+
+                for (int i = 0; i < 2; i++)
+                {
+                    if (i > 0) { _paths = pathsCopy; _minFVals = fminCopy; }
+                    var child = i == 0 ? child0 : child1;
+                    solved[i] = EcbsGenerateChild(child, curr);
+                    if (!solved[i]) continue;
+                    EcbsPushNode(child);
+                    curr.Children.Add(child);
+                }
             }
 
             if (curr.ChosenConflict != null)
@@ -83,7 +155,15 @@ public class ECBS : CBS
                 }
                 if (curr.ChosenConflict.Priority == ConflictPriority.Cardinal)
                     NumCardinalConflicts++;
+                if (curr.ChosenFrom == "cleanup") NumCleanup++;
+                else if (curr.ChosenFrom == "open") NumOpen++;
+                else NumFocal++;
             }
+
+            // 在线学习误差更新
+            if (curr.Children.Count > 0)
+                _cbsHeuristic.UpdateOnlineHeuristicErrors(curr);
+
             curr.Clear();
         }
 
@@ -139,6 +219,7 @@ public class ECBS : CBS
         root.HVal = 0;
         FindEcbsConflicts(root);
         root.UpdateDistanceToGo();
+        _cbsHeuristic.UpdateInadmissibleHeuristics(root);
         EcbsPushNode(root);
         DummyStart = root;
         return true;
@@ -153,38 +234,123 @@ public class ECBS : CBS
         NumHLGenerated++;
         node.TimeGenerated = NumHLGenerated;
         _ecbsCleanup.Enqueue(node);
-        if (node.SumOfCosts <= _w * _costLowerBound)
+        // EES：同时加入 OPEN（按 f_hat 排序）
+        _ecbsOpen.Enqueue(node);
+        // EES：f_hat <= w * inadmissible_lb 则加入 FOCAL
+        if (node.GetFHatVal() <= _w * _inadmissibleCostLowerBound)
             _ecbsFocal.Enqueue(node);
         _ecbsAllNodes.Add(node);
     }
 
+    /// <summary>
+    /// EES 节点选择（三列表策略）：
+    /// 1. 更新 inadmissible_lb = OPEN 堆顶的 f_hat，重建 FOCAL
+    /// 2. 更新 cost_lb = CLEANUP 堆顶的 f
+    /// 3. 若 FOCAL 堆顶 sum_of_costs <= w*cost_lb → 选 FOCAL（最少冲突）
+    ///    否则若 OPEN 堆顶 sum_of_costs <= w*cost_lb → 选 OPEN（最小 f_hat）
+    ///    否则选 CLEANUP（最小 f，提升下界）
+    /// </summary>
     private ECBSNode EcbsSelectNode()
     {
-        if (_ecbsCleanup.Peek().FVal > _costLowerBound)
+        // 更新 inadmissible_lb 并重建 FOCAL
+        if (!_ecbsOpen.IsEmpty &&
+            _ecbsOpen.Peek().GetFHatVal() != _inadmissibleCostLowerBound)
         {
-            double oldThr = _w * _costLowerBound;
-            _costLowerBound = Math.Max(_costLowerBound, _ecbsCleanup.Peek().FVal);
-            double newThr = _w * _costLowerBound;
+            _inadmissibleCostLowerBound = _ecbsOpen.Peek().GetFHatVal();
+            double focalThreshold = _w * _inadmissibleCostLowerBound;
+            _ecbsFocal.Clear();
             foreach (var n in _ecbsAllNodes)
-                if (n.SumOfCosts > oldThr && n.SumOfCosts <= newThr)
+                if (n.GetFHatVal() <= focalThreshold)
                     _ecbsFocal.Enqueue(n);
         }
 
+        // 更新 cost_lb
+        _costLowerBound = Math.Max(_costLowerBound, _ecbsCleanup.Peek().FVal);
+
         ECBSNode curr;
-        if (!_ecbsFocal.IsEmpty)
+        if (!_ecbsFocal.IsEmpty &&
+            _ecbsFocal.Peek().SumOfCosts <= _w * _costLowerBound)
         {
+            // 选 FOCAL：冲突最少
             curr = _ecbsFocal.Dequeue();
+            curr.ChosenFrom = "focal";
             _ecbsCleanup.Remove(curr);
+            _ecbsOpen.Remove(curr);
             NumFocal++;
+        }
+        else if (!_ecbsOpen.IsEmpty &&
+                 _ecbsOpen.Peek().SumOfCosts <= _w * _costLowerBound)
+        {
+            // 选 OPEN：f_hat 最小
+            curr = _ecbsOpen.Dequeue();
+            curr.ChosenFrom = "open";
+            _ecbsCleanup.Remove(curr);
+            if (!_ecbsFocal.IsEmpty) _ecbsFocal.Remove(curr);
+            NumOpen++;
         }
         else
         {
+            // 选 CLEANUP：f 最小，提升下界
             curr = _ecbsCleanup.Dequeue();
+            curr.ChosenFrom = "cleanup";
+            _ecbsOpen.Remove(curr);
+            if (curr.GetFHatVal() <= _w * _inadmissibleCostLowerBound)
+                _ecbsFocal.Remove(curr);
             NumCleanup++;
         }
 
         EcbsUpdatePaths(curr);
         return curr;
+    }
+
+    /// <summary>
+    /// reinsertNode：WDG 计算完后若 h 值提升，重新入三个堆并返回 true（跳过展开）。
+    /// </summary>
+    private bool EcbsReinsertNode(ECBSNode node)
+    {
+        // 若 sum_of_costs 已在次优界内，不需要重新插入
+        if (node.SumOfCosts <= _w * _costLowerBound) return false;
+        _ecbsCleanup.Enqueue(node);
+        _ecbsOpen.Enqueue(node);
+        if (node.GetFHatVal() <= _w * _inadmissibleCostLowerBound)
+            _ecbsFocal.Enqueue(node);
+        return true;
+    }
+
+    /// <summary>
+    /// Bypass 采纳：将子节点的路径、冲突、min_f 合并到当前节点。
+    /// </summary>
+    private void EcbsAdoptBypass(ECBSNode curr, ECBSNode child, List<int> fminCopy)
+    {
+        curr.SumOfCosts  = child.SumOfCosts;
+        curr.CostToGo    = child.CostToGo;
+        curr.DistanceToGo = child.DistanceToGo;
+        curr.Conflicts        = child.Conflicts;
+        curr.UnknownConflicts = child.UnknownConflicts;
+        curr.ChosenConflict   = null;
+        curr.Makespan         = child.Makespan;
+
+        foreach (var (agId, path, minF) in child.Paths)
+        {
+            bool updated = false;
+            for (int k = 0; k < curr.Paths.Count; k++)
+            {
+                if (curr.Paths[k].AgentId == agId)
+                {
+                    curr.Paths[k] = (agId, path, minF);
+                    _paths[agId]    = path;
+                    _minFVals[agId] = minF;
+                    updated = true;
+                    break;
+                }
+            }
+            if (!updated)
+            {
+                curr.Paths.Add((agId, path, fminCopy[agId]));
+                _paths[agId]    = path;
+                _minFVals[agId] = fminCopy[agId];
+            }
+        }
     }
 
     private void EcbsUpdatePaths(ECBSNode curr)
@@ -237,6 +403,7 @@ public class ECBS : CBS
 
         FindEcbsConflicts(child);
         child.UpdateDistanceToGo();
+        _cbsHeuristic.UpdateInadmissibleHeuristics(child);
         RuntimeGenerateChild += sw.Elapsed.TotalSeconds;
         return true;
     }

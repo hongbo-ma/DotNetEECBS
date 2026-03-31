@@ -44,6 +44,9 @@ ecbs.CorridorReasoning = true;   // 走廊推理
 ecbs.TargetReasoning   = true;   // 目标冲突推理
 ecbs.Heuristic.Type = HeuristicsType.WDG;
 ecbs.Heuristic.Init();
+ecbs.Bypass            = true;
+ecbs.RectangleReasoning = true;
+ecbs.Heuristic.SetInadmissibleHeuristics(HeuristicsType.Global);
 var sw = System.Diagnostics.Stopwatch.StartNew();
 bool solved = ecbs.Solve(timeLimit);
 sw.Stop();
